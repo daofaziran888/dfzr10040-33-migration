@@ -282,8 +282,8 @@ class TestBackfillAndColdStore:
             target_wide_table="WT_CS",
             hot_data_days=7,
         )
-        # 创建一些可迁移的快照
-        for i in range(3):
+        # 创建可迁移的快照（均为合法日历日期；非法日期按新规则保留待核，不参与迁冷）
+        for i in range(1, 4):
             snap = engine.create_snapshot("WT_CS", partition_key_value=f"2026110{i}")
             snap.record_count = 1000
 
@@ -291,15 +291,16 @@ class TestBackfillAndColdStore:
             cs.strategy_id, hot_partition_cutoff="20261110",
         )
         assert result["ok"] is True
-        assert result["migrated_partitions"] == 3  # 分区键值小于20261110，被迁移
+        assert result["migrated_partitions"] == 3  # 实际日期均早于 2026-11-10
         assert result["migrated_rows"] == 3000
 
         result2 = engine.migrate_to_cold_store(
             cs.strategy_id, hot_partition_cutoff="20261201",
         )
         assert result2["ok"] is True
-        assert result2["migrated_partitions"] == 3
-        assert result2["migrated_rows"] == 3000
+        # 重跑幂等：三份分区已在冷层，各自只计一次行数
+        assert result2["migrated_partitions"] == 0
+        assert result2["migrated_rows"] == 0
 
 
 class TestLineageAndMetrics:

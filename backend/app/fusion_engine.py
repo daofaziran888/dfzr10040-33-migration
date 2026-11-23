@@ -29,6 +29,13 @@ from app.models import (
     WatermarkRecord,
     WideTableDef,
 )
+from app.partition_migration import (
+    TIER_COLD,
+    TIER_HOT,
+    PartitionMigrationDetail,
+    PartitionMigrationRegistry,
+    parse_partition_date,
+)
 
 
 def _now_iso() -> str:
@@ -61,6 +68,8 @@ class FusionEngine:
         self._drifts: dict[int, DataDriftRecord] = {}
         self._monitors: dict[int, FusionMonitorMetric] = {}
         self._next_id: int = 1
+        # 分区日期迁移明细：旧文本格式 -> 可按日比较的日期键，冷热分层按它核定候选
+        self._migration_registry = PartitionMigrationRegistry()
 
     def _next_seq(self) -> int:
         sid = self._next_id
@@ -512,30 +521,115 @@ class FusionEngine:
             "complete": complete,
         }
 
+    # ---- 分区日期迁移（旧文本格式 -> 可按日比较的日期键） ----
+
+    def register_snapshot_partition_migration(
+        self, partition_id: int, confirmed: bool | None = None,
+    ) -> PartitionMigrationDetail | None:
+        """把引擎里的分区快照登记进日期迁移明细。"""
+        snap = self._snapshots.get(partition_id)
+        if snap is None:
+            return None
+        return self._migration_registry.register(snap, confirmed=confirmed)
+
+    def confirm_partition_date(self, partition_id: int,
+                               note: str = "") -> PartitionMigrationDetail | None:
+        """放行某分区的日期确认，使其进入迁冷候选范围。"""
+        snap = self._snapshots.get(partition_id)
+        if snap is None:
+            return None
+        return self._migration_registry.confirm(snap.partition_code, note)
+
+    def hold_partition_date(self, partition_id: int,
+                            note: str = "日期确认暂扣，待放行") -> PartitionMigrationDetail | None:
+        """暂扣某分区的日期确认，迁冷候选核定将排除它。"""
+        snap = self._snapshots.get(partition_id)
+        if snap is None:
+            return None
+        return self._migration_registry.hold(snap.partition_code, note)
+
+    def partition_migration_details(self) -> list[dict[str, Any]]:
+        """输出全量日期迁移明细，供冷热分层流水线核定真实候选。"""
+        self._migration_registry.sync(list(self._snapshots.values()))
+        return [detail.to_dict() for detail in self._migration_registry.list_details()]
+
+    def get_partition_by_code(self, partition_code: str) -> dict[str, Any] | None:
+        """凭原分区号取数：新旧格式并存期仍按各自的原编号读取，不改动原分区键值。"""
+        snap = next(
+            (item for item in self._snapshots.values()
+             if item.partition_code == partition_code),
+            None,
+        )
+        if snap is None:
+            return None
+        self._migration_registry.register(snap)
+        detail = self._migration_registry.get(partition_code)
+        return {
+            "分区编号": snap.partition_code,
+            "目标宽表": snap.target_wide_table,
+            "原分区键值": snap.partition_key_value,
+            "实际日期": detail.actual_date.isoformat() if detail and detail.actual_date else "",
+            "新分区键": detail.normalized_partition_key if detail else "",
+            "日期迁移状态": detail.date_migration_status if detail else "",
+            "已确认": detail.confirmed if detail else False,
+            "审核备注": detail.review_note if detail else "",
+            "记录行数": snap.record_count,
+            "存储层级": detail.storage_tier if detail else TIER_HOT,
+            "快照状态标记": snap.status_mark,
+        }
+
     def migrate_to_cold_store(self, strategy_id: int,
                               hot_partition_cutoff: str) -> dict[str, Any]:
-        """执行冷热分层迁移：将超过热数据保留期的分区迁移到冷存储。"""
+        """执行冷热分层迁移。
+
+        切点 ``hot_partition_cutoff`` 接受新旧任一种写法（``2026-11-03`` 或
+        ``20261103``），内部统一解析成真实日期后按日比较，避免新旧格式并存时
+        字符串比较冲突。候选还必须满足日期已确认；无效日期保留原值待核，不迁。
+        每个分区只计一次行数，重跑幂等。
+        """
         strategy = self._cold_stores.get(strategy_id)
         if strategy is None:
             return {"ok": False, "message": f"冷热分层策略 {strategy_id} 不存在"}
 
-        eligible_snaps = [
-            snap for snap in self._snapshots.values()
-            if snap.target_wide_table == strategy.target_wide_table
-            and snap.partition_key_value < hot_partition_cutoff
-        ]
-        migrated = 0
-        for snap in eligible_snaps:
-            migrated += snap.record_count
-            snap.status_mark = "已迁移至冷存储"
+        cutoff_parsed = parse_partition_date(hot_partition_cutoff)
+        if not cutoff_parsed.valid:
+            return {
+                "ok": False,
+                "message": f"迁冷切点 {hot_partition_cutoff!r} 不是可解析的日期，拒绝执行",
+            }
+        cutoff = cutoff_parsed.actual_date
+        assert cutoff is not None
 
-        strategy.migrated_rows += migrated
+        # 全量同步后按真实切点 + 确认状态核定候选
+        self._migration_registry.sync(list(self._snapshots.values()))
+        candidates, excluded = self._migration_registry.cold_candidates(
+            cutoff, target_wide_table=strategy.target_wide_table,
+        )
+
+        migrated_partitions: list[dict[str, Any]] = []
+        migrated_rows = 0
+        for detail in candidates:
+            counted = self._migration_registry.mark_cold(detail)
+            migrated_rows += counted
+            migrated_partitions.append({
+                "分区编号": detail.partition_code,
+                "原分区键值": detail.original_partition_value,
+                "新分区键": detail.normalized_partition_key,
+                "实际日期": detail.actual_date.isoformat() if detail.actual_date else "",
+                "记录行数": counted,
+                "存储层级": TIER_COLD,
+            })
+
+        strategy.migrated_rows += migrated_rows
         strategy.last_migration = _now_iso()
 
         return {
             "ok": True,
-            "migrated_partitions": len(eligible_snaps),
-            "migrated_rows": migrated,
+            "cutoff_date": cutoff.isoformat(),
+            "migrated_partitions": len(migrated_partitions),
+            "migrated_rows": migrated_rows,
+            "migration_details": migrated_partitions,
+            "excluded": excluded,
             "strategy_code": strategy.strategy_code,
         }
 
